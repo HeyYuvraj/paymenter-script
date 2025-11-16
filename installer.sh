@@ -1,8 +1,13 @@
 #!/bin/bash
-# Paymenter Installer – Final Hardened Version
+# Paymenter Installer – Hardened & Patched Final Version
 
+# ---------------------------------------------------------
+# Strict mode + ERR propagation
+# ---------------------------------------------------------
 set -e
+set -E
 set -o pipefail
+shopt -s errtrace
 
 # ---------------------------------------------------------
 # COLORS
@@ -22,7 +27,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ---------------------------------------------------------
-# LOGGING + GLOBAL ERROR TRAP
+# LOGGING + ERROR HANDLER
 # ---------------------------------------------------------
 LOGFILE="/var/log/paymenter-installer-$(date +%F-%H%M%S).log"
 exec > >(tee -a "$LOGFILE") 2>&1
@@ -30,14 +35,15 @@ exec > >(tee -a "$LOGFILE") 2>&1
 on_error() {
     echo -e "${COLOR_RED}"
     echo "============================================================"
-    echo " ERROR: Installer failed on line ${1}"
-    echo " Check installer log:"
-    echo "   ${LOGFILE}"
+    echo "  ERROR: Installer failed on line: $1"
+    echo ""
+    echo "  Check the log file:"
+    echo "    $LOGFILE"
     echo "============================================================"
     echo -e "${COLOR_RESET}"
     exit 1
 }
-trap 'on_error $LINENO' ERR
+trap 'on_error ${LINENO}' ERR
 
 # ---------------------------------------------------------
 # HEADER
@@ -56,6 +62,7 @@ PHP_BIN="$(command -v php || echo /usr/bin/php)"
 PHP_FPM_SOCK=""
 OS_ID=""
 OS_VERSION_ID=""
+FINAL_URL=""
 
 # ---------------------------------------------------------
 # FUNCTIONS
@@ -67,11 +74,9 @@ generate_password() {
 
 check_disk_space() {
     local required=2000
-    local free
-    free=$(df -m / | tail -1 | awk '{print $4}')
-
+    local free=$(df -m / | tail -1 | awk '{print $4}')
     if (( free < required )); then
-        echo -e "${COLOR_RED}ERROR: Not enough disk space. Minimum 2GB required.${COLOR_RESET}"
+        echo -e "${COLOR_RED}ERROR: Minimum 2GB free space required.${COLOR_RESET}"
         exit 1
     fi
 }
@@ -80,13 +85,13 @@ detect_os() {
     source /etc/os-release
     OS_ID=$ID
     OS_VERSION_ID=$VERSION_ID
-    echo -e "${COLOR_GREEN}OS Detected: $OS_ID $OS_VERSION_ID${COLOR_RESET}"
+    echo -e "${COLOR_GREEN}Detected OS: $OS_ID $OS_VERSION_ID${COLOR_RESET}"
 }
 
 detect_php_socket() {
     PHP_FPM_SOCK=$(find /var/run/php -name "php*-fpm.sock" | head -n 1)
     if [[ -z "$PHP_FPM_SOCK" ]]; then
-        echo -e "${COLOR_RED}PHP-FPM socket not found.${COLOR_RESET}"
+        echo -e "${COLOR_RED}Could not detect PHP-FPM socket.${COLOR_RESET}"
         exit 1
     fi
 }
@@ -97,8 +102,8 @@ install_dependencies() {
     if [[ "$OS_ID" == "ubuntu" ]]; then
         apt update
         apt install -y software-properties-common curl apt-transport-https ca-certificates gnupg lsof
-
         LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
+
         if [[ "$OS_VERSION_ID" != "24.04" ]]; then
             curl -sSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
                 | bash -s -- --mariadb-server-version="mariadb-10.11"
@@ -114,11 +119,12 @@ install_dependencies() {
 
         echo "deb https://packages.sury.org/php/ $(lsb_release -sc) main" \
             | tee /etc/apt/sources.list.d/sury-php.list
+        
         curl -fsSL https://packages.sury.org/php/apt.gpg \
             | gpg --dearmor -o /etc/apt/trusted.gpg.d/sury-keyring.gpg
 
         apt update
-
+        
         curl -sSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup \
             | bash -s -- --mariadb-server-version="mariadb-10.11"
 
@@ -134,10 +140,10 @@ install_dependencies() {
 
 check_mysql() {
     echo -e "${COLOR_BLUE}Checking MySQL...${COLOR_RESET}"
-    if ! mysql -e "SELECT 1" >/dev/null 2>&1; then
-        echo -e "${COLOR_RED}Cannot connect to MySQL as root.${COLOR_RESET}"
+    mysql -e "SELECT 1" >/dev/null 2>&1 || {
+        echo -e "${COLOR_RED}MySQL root login failed.${COLOR_RESET}"
         exit 1
-    fi
+    }
 }
 
 download_paymenter() {
@@ -146,27 +152,20 @@ download_paymenter() {
     mkdir -p "$PAYMENTER_DIR"
     cd "$PAYMENTER_DIR"
 
-    if ! curl -fsSL -o paymenter.tar.gz \
-        https://github.com/paymenter/paymenter/releases/latest/download/paymenter.tar.gz; then
-        echo -e "${COLOR_RED}Failed to download Paymenter.${COLOR_RESET}"
-        exit 1
-    fi
+    curl -fsSL -o paymenter.tar.gz \
+        https://github.com/paymenter/paymenter/releases/latest/download/paymenter.tar.gz
 
     tar -xzf paymenter.tar.gz
     rm -f paymenter.tar.gz
-
-    chmod -R 755 storage bootstrap/cache
 }
 
 setup_database() {
-    local esc_pass
-    esc_pass=$(printf "%s" "$DB_PASS" | sed "s/'/''/g")
+    local esc_pass=$(printf "%s" "$DB_PASS" | sed "s/'/''/g")
 
     mysql -e "CREATE USER IF NOT EXISTS 'paymenter'@'127.0.0.1' IDENTIFIED BY '${esc_pass}';"
     mysql -e "ALTER USER 'paymenter'@'127.0.0.1' IDENTIFIED BY '${esc_pass}';"
     mysql -e "CREATE DATABASE IF NOT EXISTS paymenter;"
     mysql -e "GRANT ALL PRIVILEGES ON paymenter.* TO 'paymenter'@'127.0.0.1';"
-    mysql -e "FLUSH PRIVILEGES;"
 }
 
 write_env() {
@@ -175,20 +174,15 @@ write_env() {
 
     cp -f .env.example .env
 
-    # DB
     sed -i "s|DB_DATABASE=.*|DB_DATABASE=paymenter|" .env
     sed -i "s|DB_USERNAME=.*|DB_USERNAME=paymenter|" .env
     sed -i "s|DB_PASSWORD=.*|DB_PASSWORD=${DB_PASS}|" .env
 
-    # Redis Fix
     sed -i "s|REDIS_HOST=.*|REDIS_HOST=127.0.0.1|" .env
     sed -i "s|REDIS_PORT=.*|REDIS_PORT=6379|" .env
     sed -i "s|REDIS_PASSWORD=.*|REDIS_PASSWORD=null|" .env
 
-    # Queue
     sed -i "s|QUEUE_CONNECTION=.*|QUEUE_CONNECTION=redis|" .env
-
-    # App URL
     sed -i "s|APP_URL=.*|APP_URL=${FINAL_URL}|" .env
 
     chmod 640 .env
@@ -200,8 +194,7 @@ run_artisan() {
 
     $PHP_BIN artisan key:generate --force
     $PHP_BIN artisan storage:link || true
-
-    $PHP_BIN artisan migrate --force --seed || { echo "Migration failed"; exit 1; }
+    $PHP_BIN artisan migrate --force --seed
     $PHP_BIN artisan db:seed --class=CustomPropertySeeder || true
     $PHP_BIN artisan app:init
 }
@@ -225,6 +218,7 @@ EOF
 
     systemctl daemon-reload
     systemctl enable --now paymenter.service
+    systemctl enable --now redis-server
 }
 
 setup_cron() {
@@ -257,20 +251,21 @@ server {
 EOF
 
     ln -sf /etc/nginx/sites-available/paymenter.conf /etc/nginx/sites-enabled/
+
     nginx -t
     systemctl restart nginx
 }
 
 install_ssl() {
     apt install -y python3-certbot-nginx
-
     systemctl stop nginx
+
     certbot certonly --standalone -d "$DOMAIN"
 
-    if [[ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
-        echo -e "${COLOR_RED}SSL failed.${COLOR_RESET}"
+    [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]] || {
+        echo -e "${COLOR_RED}SSL generation failed.${COLOR_RESET}"
         exit 1
-    fi
+    }
 }
 
 nginx_ssl() {
@@ -302,6 +297,7 @@ server {
 EOF
 
     ln -sf /etc/nginx/sites-available/paymenter.conf /etc/nginx/sites-enabled/
+
     nginx -t
     systemctl restart nginx
 }
@@ -309,12 +305,11 @@ EOF
 show_summary() {
     echo -e "${COLOR_GREEN}"
     echo "============================================================"
-    echo " Paymenter Installed Successfully!"
+    echo " PAYMENTER INSTALLED SUCCESSFULLY!"
     echo ""
     echo " URL: ${FINAL_URL}"
     echo " Directory: ${PAYMENTER_DIR}"
-    echo " Log File: ${LOGFILE}"
-    echo ""
+    echo " Installer Log: ${LOGFILE}"
     echo "============================================================"
     echo -e "${COLOR_RESET}"
 }
@@ -332,7 +327,7 @@ install_flow() {
 
     read -rp "Domain (panel.example.com): " DOMAIN
 
-    echo "Enter DB password (hidden, blank = auto-generate):"
+    echo "DB password (hidden, blank = random):"
     read -s -rp "> " DBP
     DB_PASS="${DBP:-$(generate_password)}"
     echo ""
@@ -345,18 +340,17 @@ install_flow() {
     download_paymenter
     setup_database
 
-    write_env  # writes FINAL_URL, so must run before artisan
+    write_env
     run_artisan
 
     setup_systemd
     setup_cron
-
     [[ "$UPY" =~ ^[Yy]$ ]] && setup_autoupdate
 
     if [[ "$SSLY" =~ ^[Yy]$ ]]; then
         install_ssl
         FINAL_URL="https://${DOMAIN}"
-        write_env       # rewrite APP_URL to https
+        write_env
         nginx_ssl
     else
         nginx_http
