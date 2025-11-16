@@ -1,4 +1,4 @@
-<h1 align="center">🚀 Paymenter Auto-Installer</h1>
+<h1 align="center">🚀 Paymenter Unofficial Auto-Installer - Currently Broken! </h1>
 
 <p align="center">
   <b>A clean, secure, professional installation script for Paymenter — optimized for Ubuntu & Debian.</b>
