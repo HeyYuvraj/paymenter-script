@@ -16,6 +16,25 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# --------- logging & error trap ----------
+LOGFILE="/var/log/paymenter-installer-$(date +%F-%H%M%S).log"
+mkdir -p /var/log
+exec > >(tee -a "$LOGFILE") 2>&1
+
+on_error() {
+    local exit_code=$?
+    local line_no=$1
+    echo -e "${COLOR_RED}"
+    echo "============================================================"
+    echo " ERROR: Installation failed on line ${line_no} (exit code ${exit_code})"
+    echo " See log file for details:"
+    echo "   ${LOGFILE}"
+    echo "============================================================"
+    echo -e "${COLOR_RESET}"
+    exit "$exit_code"
+}
+trap 'on_error $LINENO' ERR
+
 echo -e "${COLOR_BLUE}"
 echo "============================================================"
 echo "                  Paymenter Installer"
@@ -24,6 +43,9 @@ echo -e "${COLOR_RESET}"
 
 PAYMENTER_DIR="/var/www/paymenter"
 PHP_BIN="$(command -v php || echo /usr/bin/php)"
+PHP_FPM_SOCK=""
+OS_ID=""
+OS_VERSION_ID=""
 
 # --------- helper functions ----------
 
@@ -35,13 +57,23 @@ generate_password() {
     if command -v openssl >/dev/null 2>&1; then
         openssl rand -hex 16
     else
-        # fallback
         tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
+    fi
+}
+
+check_disk_space() {
+    local required_mb=2000
+    local free_mb
+    free_mb=$(df -m / | tail -1 | awk '{print $4}')
+    if (( free_mb < required_mb )); then
+        echo -e "${COLOR_RED}Not enough disk space. Need at least ${required_mb}MB free on /.${COLOR_RESET}"
+        exit 1
     fi
 }
 
 detect_os() {
     if [ -f /etc/os-release ]; then
+        # shellcheck source=/dev/null
         . /etc/os-release
         OS_ID=$ID
         OS_VERSION_ID=$VERSION_ID
@@ -52,14 +84,28 @@ detect_os() {
     echo -e "Detected OS: ${COLOR_GREEN}${OS_ID} ${OS_VERSION_ID}${COLOR_RESET}"
 }
 
+detect_php_fpm_socket() {
+    if [ -S /var/run/php/php8.3-fpm.sock ]; then
+        PHP_FPM_SOCK="/var/run/php/php8.3-fpm.sock"
+    else
+        PHP_FPM_SOCK=$(find /var/run/php -maxdepth 1 -type s -name "php*-fpm.sock" | head -n 1 || true)
+    fi
+
+    if [[ -z "$PHP_FPM_SOCK" ]]; then
+        echo -e "${COLOR_RED}Could not find a PHP-FPM socket. Ensure php8.3-fpm is installed and running.${COLOR_RESET}"
+        exit 1
+    fi
+
+    echo -e "Using PHP-FPM socket: ${COLOR_GREEN}${PHP_FPM_SOCK}${COLOR_RESET}"
+}
+
 install_dependencies() {
     echo -e "${COLOR_BLUE}Installing dependencies...${COLOR_RESET}"
 
     if [[ "$OS_ID" == "ubuntu" ]]; then
         apt update
-        apt -y install software-properties-common curl apt-transport-https ca-certificates gnupg
+        apt -y install software-properties-common curl apt-transport-https ca-certificates gnupg lsof
 
-        # Ubuntu 24.04 has PHP 8.3 in main repos; MariaDB repo only where needed
         LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php
 
         if [[ "$OS_VERSION_ID" != "24.04" ]]; then
@@ -69,11 +115,11 @@ install_dependencies() {
 
         apt update
         apt -y install php8.3 php8.3-{common,cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip,intl,redis} \
-            mariadb-server nginx tar unzip git redis-server lsof
+            mariadb-server nginx tar unzip git redis-server
 
     elif [[ "$OS_ID" == "debian" ]]; then
         apt update
-        apt -y install software-properties-common curl ca-certificates gnupg2 sudo lsb-release
+        apt -y install software-properties-common curl ca-certificates gnupg2 sudo lsb-release lsof
 
         echo "deb https://packages.sury.org/php/ $(lsb_release -sc) main" \
             | tee /etc/apt/sources.list.d/sury-php.list
@@ -86,22 +132,21 @@ install_dependencies() {
             | bash -s -- --mariadb-server-version="mariadb-10.11"
 
         apt install -y php8.3 php8.3-{common,cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip,intl,redis} \
-            mariadb-server nginx tar unzip git redis-server lsof
+            mariadb-server nginx tar unzip git redis-server
 
     else
         echo -e "${COLOR_RED}Unsupported OS. Only Ubuntu and Debian are supported.${COLOR_RESET}"
         exit 1
     fi
 
-    # refresh PHP_BIN in case php was just installed
     PHP_BIN="$(command -v php || echo /usr/bin/php)"
 }
 
 check_mysql_connection() {
     echo -e "${COLOR_BLUE}Checking MySQL connectivity as root...${COLOR_RESET}"
     if ! mysql -e "SELECT 1" >/dev/null 2>&1; then
-        echo -e "${COLOR_RED}Unable to connect to MySQL as root (no password / socket auth issue).${COLOR_RESET}"
-        echo "Try:  mysql -u root -p   and configure MySQL, then rerun this script."
+        echo -e "${COLOR_RED}Unable to connect to MySQL as root.${COLOR_RESET}"
+        echo "Run:  mysql -u root -p   and ensure you can connect, then rerun this script."
         exit 1
     fi
 }
@@ -112,7 +157,12 @@ setup_paymenter_files() {
     mkdir -p "$PAYMENTER_DIR"
     cd "$PAYMENTER_DIR"
 
-    curl -Lo paymenter.tar.gz https://github.com/paymenter/paymenter/releases/latest/download/paymenter.tar.gz
+    if ! curl -fsSL -o paymenter.tar.gz \
+        https://github.com/paymenter/paymenter/releases/latest/download/paymenter.tar.gz; then
+        echo -e "${COLOR_RED}Failed to download Paymenter archive. Check your network or GitHub availability.${COLOR_RESET}"
+        exit 1
+    fi
+
     tar -xzvf paymenter.tar.gz
     rm -f paymenter.tar.gz
 
@@ -122,10 +172,11 @@ setup_paymenter_files() {
 setup_database() {
     echo -e "${COLOR_BLUE}Setting up MySQL database...${COLOR_RESET}"
 
-    # escape single quotes for SQL
     SQL_DB_PASS=$(printf "%s" "$DB_PASS" | sed "s/'/''/g")
 
+    # If user exists, just update its password & privileges to avoid weird states
     mysql -e "CREATE USER IF NOT EXISTS 'paymenter'@'127.0.0.1' IDENTIFIED BY '${SQL_DB_PASS}';"
+    mysql -e "ALTER USER 'paymenter'@'127.0.0.1' IDENTIFIED BY '${SQL_DB_PASS}';"
     mysql -e "CREATE DATABASE IF NOT EXISTS paymenter;"
     mysql -e "GRANT ALL PRIVILEGES ON paymenter.* TO 'paymenter'@'127.0.0.1' WITH GRANT OPTION;"
     mysql -e "FLUSH PRIVILEGES;"
@@ -137,17 +188,18 @@ configure_env() {
 
     cp -n .env.example .env
 
-    # Remove old DB_* lines to avoid conflicts
     sed -i '/^DB_DATABASE=/d' .env
     sed -i '/^DB_USERNAME=/d' .env
     sed -i '/^DB_PASSWORD=/d' .env
 
-    # Append new values safely
     {
         printf '%s\n' "DB_DATABASE=paymenter"
         printf '%s\n' "DB_USERNAME=paymenter"
         printf '%s\n' "DB_PASSWORD=${DB_PASS}"
     } >> .env
+
+    chmod 640 .env || true
+    chown www-data:www-data .env || true
 }
 
 run_artisan_setup() {
@@ -156,7 +208,12 @@ run_artisan_setup() {
 
     "$PHP_BIN" artisan key:generate --force
     "$PHP_BIN" artisan storage:link || true
-    "$PHP_BIN" artisan migrate --force --seed
+
+    if ! "$PHP_BIN" artisan migrate --force --seed; then
+        echo -e "${COLOR_RED}Artisan migrate/seed failed.${COLOR_RESET}"
+        exit 1
+    fi
+
     "$PHP_BIN" artisan db:seed --class=CustomPropertySeeder || true
     "$PHP_BIN" artisan app:init
 }
@@ -221,7 +278,7 @@ server {
     }
 
     location ~ ^/index\.php(/|$) {
-        fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;
+        fastcgi_pass unix:${PHP_FPM_SOCK};
         fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
         include fastcgi_params;
         fastcgi_hide_header X-Powered-By;
@@ -232,7 +289,10 @@ EOF
     ln -sf /etc/nginx/sites-available/paymenter.conf /etc/nginx/sites-enabled/paymenter.conf
     rm -f /etc/nginx/sites-enabled/default || true
 
-    nginx -t
+    if ! nginx -t; then
+        echo -e "${COLOR_RED}Nginx configuration test failed. Check /etc/nginx/sites-available/paymenter.conf.${COLOR_RESET}"
+        exit 1
+    fi
     systemctl restart nginx
 }
 
@@ -246,11 +306,17 @@ install_certbot_and_ssl() {
         exit 1
     fi
 
-    # Use standalone mode as docs say "nothing on port 80"
     systemctl stop nginx || true
-    certbot certonly --standalone -d "${DOMAIN}"
+    if ! certbot certonly --standalone -d "${DOMAIN}"; then
+        echo -e "${COLOR_RED}Certbot failed to obtain a certificate for ${DOMAIN}.${COLOR_RESET}"
+        exit 1
+    fi
 
-    # set renew cron
+    if [ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]; then
+        echo -e "${COLOR_RED}SSL certificate files not found for ${DOMAIN}.${COLOR_RESET}"
+        exit 1
+    fi
+
     RENEW_LINE="0 23 * * * certbot renew --quiet --deploy-hook 'systemctl restart nginx'"
     (crontab -l 2>/dev/null | grep -v -F "$RENEW_LINE" ; echo "$RENEW_LINE") | crontab -
 }
@@ -286,7 +352,7 @@ server {
     }
 
     location ~ ^/index\.php(/|$) {
-        fastcgi_pass unix:/var/run/php/php8.3-fpm.sock;
+        fastcgi_pass unix:${PHP_FPM_SOCK};
         fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
         include fastcgi_params;
         fastcgi_hide_header X-Powered-By;
@@ -297,8 +363,12 @@ EOF
     ln -sf /etc/nginx/sites-available/paymenter.conf /etc/nginx/sites-enabled/paymenter.conf
     rm -f /etc/nginx/sites-enabled/default || true
 
+    if ! nginx -t; then
+        echo -e "${COLOR_RED}Nginx configuration test failed. Check /etc/nginx/sites-available/paymenter.conf.${COLOR_RESET}"
+        exit 1
+    fi
+
     pkill -9 nginx || true
-    nginx -t
     systemctl restart nginx
 }
 
@@ -315,9 +385,10 @@ show_summary() {
     echo " URL: ${FINAL_URL}"
     echo " DB Name: paymenter"
     echo " DB User: paymenter"
-    echo " DB Password: ${DB_PASS}"
+    echo " (DB password was set securely and stored in .env)"
     echo ""
     echo " Directory: ${PAYMENTER_DIR}"
+    echo " Log file: ${LOGFILE}"
     echo "============================================================"
     echo -e "${COLOR_RESET}"
 }
@@ -338,8 +409,10 @@ upgrade_paymenter() {
 # --------- main flows ----------
 
 install_flow() {
+    check_disk_space
     detect_os
     install_dependencies
+    detect_php_fpm_socket
     check_mysql_connection
 
     echo ""
@@ -350,10 +423,13 @@ install_flow() {
     fi
 
     echo ""
-    read -rp "Enter MySQL password for user 'paymenter' (leave blank to auto-generate): " DB_PASS_INPUT
+    echo "Enter MySQL password for user 'paymenter'."
+    echo "(leave blank to auto-generate; input will be hidden)"
+    read -s -rp "Password: " DB_PASS_INPUT
+    echo ""
     if [ -z "$DB_PASS_INPUT" ]; then
         DB_PASS=$(generate_password)
-        echo -e "Generated DB password: ${COLOR_YELLOW}${DB_PASS}${COLOR_RESET}"
+        # Do NOT echo the generated password
     else
         DB_PASS="$DB_PASS_INPUT"
     fi
